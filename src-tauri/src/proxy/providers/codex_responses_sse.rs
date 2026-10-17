@@ -14,7 +14,10 @@
 //! `output_item_added` / `output_item_done` helpers.
 
 use bytes::Bytes;
+use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
+
+use crate::proxy::sse::{append_utf8_safe, take_sse_block};
 
 /// Serialize one Responses SSE event with the standard `event:`/`data:` framing.
 pub(crate) fn sse_event(event: &str, data: Value) -> Bytes {
@@ -23,6 +26,114 @@ pub(crate) fn sse_event(event: &str, data: Value) -> Bytes {
         serde_json::to_string(&data).unwrap_or_default()
     ))
 }
+
+/// Stamp complete Responses SSE event frames with a monotonic top-level `sequence_number`.
+pub(crate) fn stamp_sequence_numbers<S, E>(
+    stream: S,
+) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    async_stream::stream! {
+        let mut stream = std::pin::pin!(stream);
+        let mut sequence_number: u64 = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(event) => {
+                    let stamped = inject_sequence_number(&event, sequence_number);
+                    sequence_number += 1;
+                    yield Ok(stamped);
+                }
+                Err(error) => yield Err(error),
+            }
+        }
+    }
+}
+
+/// Frame raw upstream SSE byte chunks into complete events, then stamp sequence numbers.
+///
+/// Native Responses passthrough yields transport chunks, not whole SSE frames. Re-frame
+/// first so Grok Build / Codex receive one stamped event per `data:` block.
+pub(crate) fn stamp_raw_sse_byte_stream<S, E>(
+    stream: S,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + 'static,
+{
+    async_stream::stream! {
+        let mut stream = std::pin::pin!(stream);
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut sequence_number: u64 = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    while let Some(block) = take_sse_block(&mut buffer) {
+                        if block.trim().is_empty() {
+                            continue;
+                        }
+                        let framed = Bytes::from(format!("{block}\n\n"));
+                        let stamped = inject_sequence_number(&framed, sequence_number);
+                        sequence_number += 1;
+                        yield Ok(stamped);
+                    }
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(error.to_string()));
+                    return;
+                }
+            }
+        }
+        if !utf8_remainder.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
+        }
+        let tail = std::mem::take(&mut buffer);
+        if !tail.trim().is_empty() {
+            let framed = Bytes::from(format!("{tail}\n\n"));
+            let stamped = inject_sequence_number(&framed, sequence_number);
+            yield Ok(stamped);
+        }
+    }
+}
+
+pub(crate) fn error_code_for(error_type: Option<&str>, upstream_code: Option<&str>) -> String {
+    if let Some(code) = upstream_code.filter(|code| !code.is_empty()) {
+        return code.to_string();
+    }
+    match error_type {
+        Some("rate_limit_error") => "rate_limit_exceeded".to_string(),
+        Some(other) => other.to_string(),
+        None => "proxy_error".to_string(),
+    }
+}
+
+/// Inject top-level `sequence_number` into one already-framed SSE event.
+pub(crate) fn inject_sequence_number(event: &Bytes, sequence_number: u64) -> Bytes {
+    let text = String::from_utf8_lossy(event);
+    let mut lines = text.splitn(3, '\n');
+    let Some(event_line) = lines.next() else {
+        return event.clone();
+    };
+    let Some(data_line) = lines.next() else {
+        return event.clone();
+    };
+    let Some(payload) = data_line.strip_prefix("data: ") else {
+        return event.clone();
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
+        return event.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return event.clone();
+    };
+    object.insert("sequence_number".to_string(), json!(sequence_number));
+    let new_payload = serde_json::to_string(&value).unwrap_or_default();
+    Bytes::from(format!("{event_line}\ndata: {new_payload}\n\n"))
+}
+
 
 // ---------------------------------------------------------------------------
 // Response lifecycle (created / in_progress / completed / failed)

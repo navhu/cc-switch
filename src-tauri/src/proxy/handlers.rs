@@ -19,6 +19,7 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream,
+        codex_responses_sse::stamp_sequence_numbers,
         get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
         streaming_codex_anthropic::{
@@ -1219,6 +1220,7 @@ async fn handle_codex_native_compaction_response(
     let compaction_stream = super::providers::codex_compaction::create_native_compaction_sse_stream(
         response.bytes_stream(),
     );
+    let compaction_stream = stamp_sequence_numbers(compaction_stream);
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
     let logged_stream = create_logged_passthrough_stream(
         compaction_stream,
@@ -1519,6 +1521,7 @@ async fn handle_codex_late_arguments_repair(
         super::providers::responses_late_arguments::create_late_arguments_repair_stream(
             response.bytes_stream(),
         );
+    let repair_stream = stamp_sequence_numbers(repair_stream);
     let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
     let logged_stream = create_logged_passthrough_stream(
         repair_stream,
@@ -1574,6 +1577,7 @@ async fn handle_codex_xai_native_responses_rewrite(
                 response.bytes_stream(),
                 restore_map,
             );
+        let restore_stream = stamp_sequence_numbers(restore_stream);
         let usage_collector =
             create_usage_collector(ctx, state, status.as_u16(), &CODEX_PARSER_CONFIG);
         let logged_stream = create_logged_passthrough_stream(
@@ -1707,6 +1711,7 @@ async fn handle_codex_chat_to_responses_transform(
         let stream = response.bytes_stream();
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
+        let sse_stream = stamp_sequence_numbers(sse_stream);
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -1994,6 +1999,7 @@ async fn handle_codex_anthropic_to_responses_transform(
         let events =
             responses_sse_events_from_anthropic_message(&anthropic_response, codex_tool_context);
         let sse_stream = futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
+        let sse_stream = stamp_sequence_numbers(sse_stream);
         return build_codex_anthropic_sse_response(
             sse_stream,
             ctx,

@@ -17,6 +17,7 @@ use crate::database::PRICING_SOURCE_REQUEST;
 use axum::http::{header::HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use crate::proxy::providers::codex_responses_sse::stamp_raw_sse_byte_stream;
 use futures::stream::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
@@ -199,6 +200,25 @@ pub async fn handle_streaming(
 
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
+
+    // Grok Build / Codex 原生 Responses 透传需要顶层 sequence_number。
+    if matches!(ctx.app_type_str, "grokbuild" | "codex") {
+        let logged_stream = create_logged_passthrough_stream(
+            stamp_raw_sse_byte_stream(stream),
+            ctx.tag,
+            usage_collector,
+            timeout_config,
+            connection_guard,
+        );
+        let body = axum::body::Body::from_stream(logged_stream);
+        return match builder.body(body) {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::error!("[{}] 构建流式响应失败: {e}", ctx.tag);
+                ProxyError::Internal(format!("Failed to build streaming response: {e}")).into_response()
+            }
+        };
+    }
 
     // 创建带日志和超时的透传流
     let logged_stream = create_logged_passthrough_stream(
