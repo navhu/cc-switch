@@ -1951,6 +1951,7 @@ async fn handle_codex_anthropic_to_responses_transform(
         let stream = response.bytes_stream();
         let sse_stream =
             create_responses_sse_stream_from_anthropic_with_context(stream, codex_tool_context);
+        let sse_stream = stamp_sequence_numbers(sse_stream);
         return build_codex_anthropic_sse_response(
             sse_stream,
             ctx,
